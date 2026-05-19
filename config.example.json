@@ -1,0 +1,10 @@
+{
+  "provider": "openai",
+  "apiKey": "",
+  "model": "gpt-image-2",
+  "size": "1024x1024",
+  "quality": "medium",
+  "outputFormat": "png",
+  "host": "127.0.0.1",
+  "port": 8000
+}

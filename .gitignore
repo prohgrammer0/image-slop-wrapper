@@ -1,0 +1,10 @@
+config.json
+requests.yaml
+
+outputs/*
+!outputs/.gitkeep
+
+reference-images/*
+!reference-images/.gitkeep
+
+.DS_Store
