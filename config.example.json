@@ -2,6 +2,16 @@
   "provider": "openai",
   "apiKey": "",
   "model": "gpt-image-2",
+  "providers": {
+    "openai": {
+      "apiKey": "",
+      "models": ["gpt-image-2"]
+    },
+    "mulerouter": {
+      "apiKey": "",
+      "models": ["wan2.6-image"]
+    }
+  },
   "size": "1024x1024",
   "quality": "medium",
   "outputFormat": "png",

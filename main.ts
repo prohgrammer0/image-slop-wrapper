@@ -1,6 +1,11 @@
-type ProviderName = "openai";
+type ProviderName = "openai" | "mulerouter";
 type ImageQuality = "low" | "medium" | "high" | "auto";
 type ImageFormat = "png" | "jpeg" | "webp";
+
+type ProviderConfig = {
+  apiKey: string;
+  models: string[];
+};
 
 type AppConfig = {
   provider: ProviderName;
@@ -11,6 +16,7 @@ type AppConfig = {
   outputFormat: ImageFormat;
   host: string;
   port: number;
+  providers: Record<ProviderName, ProviderConfig>;
 };
 
 type ReferenceImage = {
@@ -42,11 +48,53 @@ type GenerateResult = {
   durationMs: number;
 };
 
+type ModelOption = {
+  label: string;
+  provider: ProviderName;
+  model: string;
+};
+
+type SelectedModel = ModelOption & {
+  apiKey: string;
+};
+
+type MuleRouterPayload = {
+  task_info?: {
+    id?: string;
+    status?: string;
+    error?: {
+      title?: string;
+      detail?: string;
+    };
+  };
+  images?: string[];
+  error?: {
+    message?: string;
+  };
+  detail?: string;
+  message?: string;
+};
+
 const CONFIG_PATH = "config.json";
 const REFERENCE_DIR = "reference-images";
 const OUTPUT_DIR = "outputs";
 const HISTORY_PATH = "requests.yaml";
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+const MODEL_OPTIONS: ModelOption[] = [
+  {
+    label: "OpenAI GPT Image 2",
+    provider: "openai",
+    model: "gpt-image-2",
+  },
+  {
+    label: "Alibaba Wan 2.6 Image",
+    provider: "mulerouter",
+    model: "wan2.6-image",
+  },
+];
+const MULEROUTER_API_BASE = "https://api.mulerouter.ai";
+const MULEROUTER_TASK_TIMEOUT_MS = 240_000;
+const MULEROUTER_TASK_POLL_MS = 2_000;
 
 export const DEFAULT_CONFIG: AppConfig = {
   provider: "openai",
@@ -57,6 +105,16 @@ export const DEFAULT_CONFIG: AppConfig = {
   outputFormat: "png",
   host: "127.0.0.1",
   port: 8000,
+  providers: {
+    openai: {
+      apiKey: "",
+      models: ["gpt-image-2"],
+    },
+    mulerouter: {
+      apiKey: "",
+      models: ["wan2.6-image"],
+    },
+  },
 };
 
 export function clampImageCount(value: FormDataEntryValue | null): number {
@@ -86,16 +144,80 @@ export function isSupportedImage(filename: string): boolean {
 async function loadConfig(): Promise<AppConfig> {
   try {
     const text = await Deno.readTextFile(CONFIG_PATH);
-    return { ...DEFAULT_CONFIG, ...JSON.parse(text) };
+    return normalizeConfig(JSON.parse(text));
   } catch (error) {
     if (error instanceof Deno.errors.NotFound) {
       throw new Error(
-        `Missing ${CONFIG_PATH}. Copy config.example.json to ${CONFIG_PATH} and add your OpenAI API key.`,
+        `Missing ${CONFIG_PATH}. Copy config.example.json to ${CONFIG_PATH} and add at least one API key.`,
       );
     }
 
     throw error;
   }
+}
+
+function normalizeConfig(rawConfig: Partial<AppConfig>): AppConfig {
+  const merged = {
+    ...DEFAULT_CONFIG,
+    ...rawConfig,
+    providers: {
+      openai: {
+        ...DEFAULT_CONFIG.providers.openai,
+        ...rawConfig.providers?.openai,
+      },
+      mulerouter: {
+        ...DEFAULT_CONFIG.providers.mulerouter,
+        ...rawConfig.providers?.mulerouter,
+      },
+    },
+  };
+
+  if (rawConfig.apiKey && !rawConfig.providers?.openai?.apiKey) {
+    merged.providers.openai.apiKey = rawConfig.apiKey;
+  }
+
+  if (rawConfig.model && !rawConfig.providers?.openai?.models) {
+    merged.providers.openai.models = [rawConfig.model];
+  }
+
+  return merged;
+}
+
+export function availableModels(config: AppConfig): ModelOption[] {
+  return MODEL_OPTIONS.filter((option) => {
+    const provider = config.providers[option.provider];
+    return Boolean(provider?.apiKey) && provider.models.includes(option.model);
+  });
+}
+
+function modelValue(option: ModelOption): string {
+  return `${option.provider}:${option.model}`;
+}
+
+function selectedModelFromValue(
+  config: AppConfig,
+  value: string | null,
+): SelectedModel {
+  const options = availableModels(config);
+  if (options.length === 0) {
+    throw new Error(
+      `Set an API key in ${CONFIG_PATH} for at least one configured provider before generating images.`,
+    );
+  }
+
+  const fallback = options.find((option) => option.model === config.model) ??
+    options[0];
+  const option = value
+    ? options.find((candidate) => modelValue(candidate) === value)
+    : fallback;
+  if (!option) {
+    throw new Error(
+      "Selected model is not available for the configured API keys.",
+    );
+  }
+
+  const apiKey = config.providers[option.provider].apiKey;
+  return { ...option, apiKey };
 }
 
 async function ensureDirectories(): Promise<void> {
@@ -120,22 +242,22 @@ async function listReferenceImages(): Promise<ReferenceImage[]> {
 
 async function generateImages(
   config: AppConfig,
+  selectedModel: SelectedModel,
   prompt: string,
   count: number,
   referenceImages: ReferenceImage[],
 ): Promise<ImageAttempt[]> {
-  if (config.provider !== "openai") {
-    throw new Error(`Unsupported provider: ${config.provider}`);
-  }
-
   const attempts: ImageAttempt[] = [];
   for (let index = 0; index < count; index += 1) {
     const attemptIndex = index + 1;
     try {
       console.log(`Generate image attempt: index=${attemptIndex}/${count}`);
-      const imageBytes = referenceImages.length > 0
-        ? await editOpenAIImage(config, prompt, referenceImages)
-        : await generateOpenAIImage(config, prompt);
+      const imageBytes = await generateImage(
+        config,
+        selectedModel,
+        prompt,
+        referenceImages,
+      );
       const filename = outputFilename(config.outputFormat, attemptIndex);
       const path = `${OUTPUT_DIR}/${filename}`;
       await Deno.writeFile(path, imageBytes);
@@ -160,18 +282,40 @@ async function generateImages(
   return attempts;
 }
 
+async function generateImage(
+  config: AppConfig,
+  selectedModel: SelectedModel,
+  prompt: string,
+  referenceImages: ReferenceImage[],
+): Promise<Uint8Array> {
+  switch (selectedModel.provider) {
+    case "openai":
+      return referenceImages.length > 0
+        ? await editOpenAIImage(config, selectedModel, prompt, referenceImages)
+        : await generateOpenAIImage(config, selectedModel, prompt);
+    case "mulerouter":
+      return await generateMuleRouterImage(
+        config,
+        selectedModel,
+        prompt,
+        referenceImages,
+      );
+  }
+}
+
 async function generateOpenAIImage(
   config: AppConfig,
+  selectedModel: SelectedModel,
   prompt: string,
 ): Promise<Uint8Array> {
   const response = await fetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${config.apiKey}`,
+      "Authorization": `Bearer ${selectedModel.apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: config.model,
+      model: selectedModel.model,
       prompt,
       size: config.size,
       quality: config.quality,
@@ -184,11 +328,12 @@ async function generateOpenAIImage(
 
 async function editOpenAIImage(
   config: AppConfig,
+  selectedModel: SelectedModel,
   prompt: string,
   referenceImages: ReferenceImage[],
 ): Promise<Uint8Array> {
   const form = new FormData();
-  form.set("model", config.model);
+  form.set("model", selectedModel.model);
   form.set("prompt", prompt);
   form.set("size", config.size);
   form.set("quality", config.quality);
@@ -205,12 +350,144 @@ async function editOpenAIImage(
   const response = await fetch("https://api.openai.com/v1/images/edits", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${config.apiKey}`,
+      "Authorization": `Bearer ${selectedModel.apiKey}`,
     },
     body: form,
   });
 
   return imageBytesFromOpenAIResponse(response);
+}
+
+async function generateMuleRouterImage(
+  config: AppConfig,
+  selectedModel: SelectedModel,
+  prompt: string,
+  referenceImages: ReferenceImage[],
+): Promise<Uint8Array> {
+  const images = await Promise.all(
+    referenceImages.slice(0, 2).map(localImageAsDataUrl),
+  );
+  const generation = await fetch(
+    `${MULEROUTER_API_BASE}/vendors/alibaba/v1/${selectedModel.model}/generation`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${selectedModel.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prompt,
+        ...(images.length > 0 ? { images } : {}),
+        size: config.size.replace("x", "*"),
+        n: 1,
+        prompt_extend: false,
+        safety_filter: true,
+      }),
+    },
+  );
+  const taskId = await muleRouterTaskIdFromResponse(generation);
+  const imageUrl = await waitForMuleRouterImage(selectedModel, taskId);
+  const imageResponse = await fetch(imageUrl);
+  if (!imageResponse.ok) {
+    throw new Error(
+      `MuleRouter image download returned ${imageResponse.status}`,
+    );
+  }
+
+  return new Uint8Array(await imageResponse.arrayBuffer());
+}
+
+async function localImageAsDataUrl(image: ReferenceImage): Promise<string> {
+  const bytes = await Deno.readFile(image.path);
+  return `data:${contentTypeForFilename(image.name)};base64,${
+    encodeBase64(bytes)
+  }`;
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+async function muleRouterTaskIdFromResponse(
+  response: Response,
+): Promise<string> {
+  const payload = await muleRouterJson(response, "create task");
+  const taskId = payload.task_info?.id;
+  if (typeof taskId !== "string" || !taskId) {
+    throw new Error("MuleRouter response did not include a task id.");
+  }
+
+  return taskId;
+}
+
+async function waitForMuleRouterImage(
+  selectedModel: SelectedModel,
+  taskId: string,
+): Promise<string> {
+  const deadline = Date.now() + MULEROUTER_TASK_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await delay(MULEROUTER_TASK_POLL_MS);
+    const response = await fetch(
+      `${MULEROUTER_API_BASE}/vendors/alibaba/v1/${selectedModel.model}/generation/${taskId}`,
+      {
+        headers: {
+          "Authorization": `Bearer ${selectedModel.apiKey}`,
+        },
+      },
+    );
+    const payload = await muleRouterJson(response, "poll task");
+    const status = payload.task_info?.status;
+    if (status === "completed") {
+      const imageUrl = payload.images?.[0];
+      if (typeof imageUrl !== "string" || !imageUrl) {
+        throw new Error("MuleRouter task completed without an image URL.");
+      }
+      return imageUrl;
+    }
+
+    if (status === "failed") {
+      const detail = payload.task_info?.error?.detail ??
+        payload.task_info?.error?.title ??
+        "task failed";
+      throw new Error(`MuleRouter ${detail}`);
+    }
+  }
+
+  throw new Error(
+    `MuleRouter task timed out after ${MULEROUTER_TASK_TIMEOUT_MS}ms.`,
+  );
+}
+
+async function muleRouterJson(
+  response: Response,
+  action: string,
+): Promise<MuleRouterPayload> {
+  const text = await response.text();
+  let payload: MuleRouterPayload;
+
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(
+      `MuleRouter ${action} returned ${response.status}: ${text}`,
+    );
+  }
+
+  if (!response.ok) {
+    const message = payload.error?.message ?? payload.detail ??
+      payload.message ?? `MuleRouter ${action} returned ${response.status}`;
+    throw new Error(message);
+  }
+
+  return payload;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function imageBytesFromOpenAIResponse(
@@ -302,7 +579,7 @@ function selectedReferenceImages(
 }
 
 async function appendHistoryRecord(
-  config: AppConfig,
+  selectedModel: SelectedModel,
   prompt: string,
   requestedCount: number,
   referenceImages: ReferenceImage[],
@@ -325,7 +602,7 @@ async function appendHistoryRecord(
     renderHistoryRecord({
       date: new Date().toISOString(),
       prompt,
-      model: config.model,
+      model: modelValue(selectedModel),
       referenceImages: referenceImages.map((image) => image.name),
       requestedCount,
       status,
@@ -401,6 +678,11 @@ function renderPage(
   config: AppConfig,
   referenceImages: ReferenceImage[],
 ): string {
+  const models = availableModels(config);
+  const selectedModel =
+    models.find((option) => option.model === config.model) ??
+      models[0] ??
+      null;
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -421,8 +703,12 @@ function renderPage(
       <header class="flex flex-col gap-2 border-b border-zinc-800 pb-6">
         <h1 class="text-3xl font-semibold tracking-normal text-white">Image Slop Wrapper</h1>
         <p class="max-w-3xl text-sm leading-6 text-zinc-400">
-          ${escapeHtml(config.provider)} / ${
-    escapeHtml(config.model)
+          ${
+    selectedModel
+      ? `${escapeHtml(selectedModel.provider)} / ${
+        escapeHtml(selectedModel.model)
+      }`
+      : "No configured API key"
   } using ${referenceImages.length} local reference image${
     referenceImages.length === 1 ? "" : "s"
   }.
@@ -448,7 +734,19 @@ function renderPage(
             ></textarea>
           </label>
 
-          <div class="grid gap-4 sm:grid-cols-[160px_1fr] sm:items-end">
+          <div class="grid gap-4 sm:grid-cols-[minmax(0,1fr)_160px]">
+            <label class="flex flex-col gap-2">
+              <span class="text-sm font-medium text-zinc-200">Model</span>
+              <select
+                name="model"
+                required
+                ${models.length === 0 ? "disabled" : ""}
+                class="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                ${renderModelOptions(models, selectedModel)}
+              </select>
+            </label>
+
             <label class="flex flex-col gap-2">
               <span class="text-sm font-medium text-zinc-200">Count</span>
               <select
@@ -461,11 +759,14 @@ function renderPage(
                 <option value="4">4 images</option>
               </select>
             </label>
+          </div>
 
+          <div class="flex justify-end">
             <button
               id="generate-button"
               type="submit"
-              class="inline-flex h-10 items-center justify-center rounded-md bg-sky-500 px-4 text-sm font-semibold text-zinc-950 transition hover:bg-sky-400 disabled:cursor-wait disabled:opacity-60"
+              ${models.length === 0 ? "disabled" : ""}
+              class="inline-flex h-10 items-center justify-center rounded-md bg-sky-500 px-4 text-sm font-semibold text-zinc-950 transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <span class="idle-label">Generate</span>
             </button>
@@ -568,6 +869,27 @@ function renderPage(
     </script>
   </body>
 </html>`;
+}
+
+function renderModelOptions(
+  models: ModelOption[],
+  selectedModel: ModelOption | null,
+): string {
+  if (models.length === 0) {
+    return `<option value="">No API keys configured</option>`;
+  }
+
+  return models
+    .map((option) => {
+      const value = modelValue(option);
+      const selected = selectedModel && modelValue(selectedModel) === value
+        ? " selected"
+        : "";
+      return `<option value="${escapeHtml(value)}"${selected}>${
+        escapeHtml(option.label)
+      }</option>`;
+    })
+    .join("");
 }
 
 function renderReferenceList(referenceImages: ReferenceImage[]): string {
@@ -754,13 +1076,11 @@ async function handler(request: Request): Promise<Response> {
     const startedAt = Date.now();
     try {
       const config = await loadConfig();
-      if (!config.apiKey) {
-        throw new Error(
-          `Set apiKey in ${CONFIG_PATH} before generating images.`,
-        );
-      }
-
       const form = await request.formData();
+      const selectedModel = selectedModelFromValue(
+        config,
+        String(form.get("model") ?? ""),
+      );
       const prompt = String(form.get("prompt") ?? "").trim();
       if (!prompt) {
         throw new Error("Prompt is required.");
@@ -776,10 +1096,13 @@ async function handler(request: Request): Promise<Response> {
         selectedNames,
       );
       console.log(
-        `Generate request: count=${count} selected_references=${referenceImages.length} prompt_chars=${prompt.length}`,
+        `Generate request: model=${
+          modelValue(selectedModel)
+        } count=${count} selected_references=${referenceImages.length} prompt_chars=${prompt.length}`,
       );
       const attempts = await generateImages(
         config,
+        selectedModel,
         prompt,
         count,
         referenceImages,
@@ -787,7 +1110,7 @@ async function handler(request: Request): Promise<Response> {
       const durationMs = Date.now() - startedAt;
       const result = { attempts, durationMs };
       await appendHistoryRecord(
-        config,
+        selectedModel,
         prompt,
         count,
         referenceImages,
