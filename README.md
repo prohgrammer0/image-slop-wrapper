@@ -1,7 +1,8 @@
 # Image Slop Wrapper
 
-A minimal Deno app for generating images with OpenAI and Alibaba models through
-MuleRouter using a prompt and local reference images.
+A minimal Deno app for generating images with OpenAI, Alibaba models through
+MuleRouter, and Grok Imagine through xAI using a prompt and local reference
+images.
 
 The app uses a server-rendered HTML page with a small amount of browser
 JavaScript, htmx, and Tailwind from CDNs. Reference images are read from a local
@@ -21,7 +22,8 @@ models whose provider has a non-empty API key.
 
 OpenAI keys go in `providers.openai.apiKey`. MuleRouter keys go in
 `providers.mulerouter.apiKey`; create one at
-<https://www.mulerouter.ai/app/api-keys>.
+<https://www.mulerouter.ai/app/api-keys>. xAI keys go in `providers.xai.apiKey`;
+create one at <https://console.x.ai/>.
 
 ```json
 {
@@ -35,6 +37,14 @@ OpenAI keys go in `providers.openai.apiKey`. MuleRouter keys go in
     "mulerouter": {
       "apiKey": "mr-...",
       "models": ["wan2.6-image"]
+    },
+    "xai": {
+      "apiKey": "xai-...",
+      "models": [
+        "grok-imagine-image-quality",
+        "grok-imagine-image",
+        "grok-imagine-image-pro"
+      ]
     }
   },
   "size": "1024x1024",
@@ -65,6 +75,20 @@ https://api.mulerouter.ai/vendors/alibaba/v1/wan2.6-image/generation
 MuleRouter docs:
 <https://www.mulerouter.ai/docs/api-reference/endpoint/alibaba/wan2.6-image/generation>
 
+xAI's Grok Imagine image models use:
+
+```text
+https://api.x.ai/v1/images/generations
+https://api.x.ai/v1/images/edits
+```
+
+The xAI edit API accepts up to three local reference images as base64 data URIs.
+Generated xAI images are downloaded from the temporary URL returned by the API
+and saved using the returned image MIME type.
+
+xAI docs: <https://docs.x.ai/developers/model-capabilities/images/generation>
+<https://docs.x.ai/developers/model-capabilities/images/editing>
+
 ## Usage
 
 Start the app:
@@ -93,7 +117,7 @@ request appears as a separate job panel.
 ## Files
 
 - `reference-images/`: local reference images.
-- `outputs/`: generated images.
+- `outputs/`: generated images. Filenames include the provider/model slug.
 - `requests.yaml`: local request history.
 - `config.json`: local API configuration.
 - `config.example.json`: checked-in config template.

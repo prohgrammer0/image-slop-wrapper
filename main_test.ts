@@ -6,6 +6,7 @@ import {
   escapeHtml,
   extname,
   isSupportedImage,
+  outputFilename,
 } from "./main.ts";
 
 Deno.test("clampImageCount keeps requests in the supported range", () => {
@@ -39,6 +40,16 @@ Deno.test("isSupportedImage accepts local reference image formats", () => {
   assertEquals(isSupportedImage("notes.txt"), false);
 });
 
+Deno.test("outputFilename includes a filesystem-safe model slug", () => {
+  const filename = outputFilename("jpeg", 2, "xai:grok-imagine-image-quality");
+
+  assertEquals(
+    filename.endsWith("-xai-grok-imagine-image-quality-2.jpeg"),
+    true,
+  );
+  assertEquals(filename.includes(":"), false);
+});
+
 Deno.test("availableModels hides providers without an API key", () => {
   assertEquals(availableModels(DEFAULT_CONFIG), []);
 
@@ -57,7 +68,7 @@ Deno.test("availableModels hides providers without an API key", () => {
     ["gpt-image-2"],
   );
 
-  const bothProviders = {
+  const openAIAndMuleRouter = {
     ...openaiOnly,
     providers: {
       ...openaiOnly.providers,
@@ -68,7 +79,28 @@ Deno.test("availableModels hides providers without an API key", () => {
     },
   };
   assertEquals(
-    availableModels(bothProviders).map((option) => option.model),
+    availableModels(openAIAndMuleRouter).map((option) => option.model),
     ["gpt-image-2", "wan2.6-image"],
+  );
+
+  const allProviders = {
+    ...openAIAndMuleRouter,
+    providers: {
+      ...openAIAndMuleRouter.providers,
+      xai: {
+        ...openAIAndMuleRouter.providers.xai,
+        apiKey: "xai-test",
+      },
+    },
+  };
+  assertEquals(
+    availableModels(allProviders).map((option) => option.model),
+    [
+      "gpt-image-2",
+      "wan2.6-image",
+      "grok-imagine-image-quality",
+      "grok-imagine-image",
+      "grok-imagine-image-pro",
+    ],
   );
 });

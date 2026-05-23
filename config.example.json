@@ -10,6 +10,14 @@
     "mulerouter": {
       "apiKey": "",
       "models": ["wan2.6-image"]
+    },
+    "xai": {
+      "apiKey": "",
+      "models": [
+        "grok-imagine-image-quality",
+        "grok-imagine-image",
+        "grok-imagine-image-pro"
+      ]
     }
   },
   "size": "1024x1024",

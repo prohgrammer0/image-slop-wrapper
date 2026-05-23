@@ -1,4 +1,4 @@
-type ProviderName = "openai" | "mulerouter";
+type ProviderName = "openai" | "mulerouter" | "xai";
 type ImageQuality = "low" | "medium" | "high" | "auto";
 type ImageFormat = "png" | "jpeg" | "webp";
 
@@ -28,6 +28,7 @@ type SavedImage = {
   filename: string;
   path: string;
   url: string;
+  model: string;
 };
 
 type FailedImage = {
@@ -41,6 +42,11 @@ type ImageAttempt = {
   index: number;
   saved?: SavedImage;
   failure?: FailedImage;
+};
+
+type GeneratedImage = {
+  bytes: Uint8Array;
+  format: ImageFormat;
 };
 
 type GenerateResult = {
@@ -75,6 +81,19 @@ type MuleRouterPayload = {
   message?: string;
 };
 
+type XAIImagePayload = {
+  data?: Array<{
+    b64_json?: string;
+    url?: string;
+    mime_type?: string;
+  }>;
+  error?: {
+    message?: string;
+  };
+  detail?: string;
+  message?: string;
+};
+
 const CONFIG_PATH = "config.json";
 const REFERENCE_DIR = "reference-images";
 const OUTPUT_DIR = "outputs";
@@ -91,10 +110,26 @@ const MODEL_OPTIONS: ModelOption[] = [
     provider: "mulerouter",
     model: "wan2.6-image",
   },
+  {
+    label: "Grok Imagine Image Quality",
+    provider: "xai",
+    model: "grok-imagine-image-quality",
+  },
+  {
+    label: "Grok Imagine Image",
+    provider: "xai",
+    model: "grok-imagine-image",
+  },
+  {
+    label: "Grok Imagine Image Pro",
+    provider: "xai",
+    model: "grok-imagine-image-pro",
+  },
 ];
 const MULEROUTER_API_BASE = "https://api.mulerouter.ai";
 const MULEROUTER_TASK_TIMEOUT_MS = 240_000;
 const MULEROUTER_TASK_POLL_MS = 2_000;
+const XAI_API_BASE = "https://api.x.ai/v1";
 
 export const DEFAULT_CONFIG: AppConfig = {
   provider: "openai",
@@ -113,6 +148,14 @@ export const DEFAULT_CONFIG: AppConfig = {
     mulerouter: {
       apiKey: "",
       models: ["wan2.6-image"],
+    },
+    xai: {
+      apiKey: "",
+      models: [
+        "grok-imagine-image-quality",
+        "grok-imagine-image",
+        "grok-imagine-image-pro",
+      ],
     },
   },
 };
@@ -168,6 +211,10 @@ function normalizeConfig(rawConfig: Partial<AppConfig>): AppConfig {
       mulerouter: {
         ...DEFAULT_CONFIG.providers.mulerouter,
         ...rawConfig.providers?.mulerouter,
+      },
+      xai: {
+        ...DEFAULT_CONFIG.providers.xai,
+        ...rawConfig.providers?.xai,
       },
     },
   };
@@ -247,39 +294,40 @@ async function generateImages(
   count: number,
   referenceImages: ReferenceImage[],
 ): Promise<ImageAttempt[]> {
-  const attempts: ImageAttempt[] = [];
-  for (let index = 0; index < count; index += 1) {
+  const attempts = Array.from({ length: count }, async (_, index) => {
     const attemptIndex = index + 1;
     try {
       console.log(`Generate image attempt: index=${attemptIndex}/${count}`);
-      const imageBytes = await generateImage(
+      const image = await generateImage(
         config,
         selectedModel,
         prompt,
         referenceImages,
       );
-      const filename = outputFilename(config.outputFormat, attemptIndex);
+      const model = modelValue(selectedModel);
+      const filename = outputFilename(image.format, attemptIndex, model);
       const path = `${OUTPUT_DIR}/${filename}`;
-      await Deno.writeFile(path, imageBytes);
+      await Deno.writeFile(path, image.bytes);
       const saved = {
         filename,
         path,
         url: `/outputs/${encodeURIComponent(filename)}`,
+        model,
       };
-      attempts.push({ index: attemptIndex, saved });
       console.log(
         `Generate image saved: index=${attemptIndex}/${count} filename=${filename}`,
       );
+      return { index: attemptIndex, saved };
     } catch (error) {
       const failure = failedImageFromError(attemptIndex, error);
-      attempts.push({ index: attemptIndex, failure });
       console.error(
         `Generate image failed: index=${attemptIndex}/${count} message=${failure.message}`,
       );
+      return { index: attemptIndex, failure };
     }
-  }
+  });
 
-  return attempts;
+  return await Promise.all(attempts);
 }
 
 async function generateImage(
@@ -287,14 +335,32 @@ async function generateImage(
   selectedModel: SelectedModel,
   prompt: string,
   referenceImages: ReferenceImage[],
-): Promise<Uint8Array> {
+): Promise<GeneratedImage> {
   switch (selectedModel.provider) {
     case "openai":
-      return referenceImages.length > 0
-        ? await editOpenAIImage(config, selectedModel, prompt, referenceImages)
-        : await generateOpenAIImage(config, selectedModel, prompt);
+      return {
+        bytes: referenceImages.length > 0
+          ? await editOpenAIImage(
+            config,
+            selectedModel,
+            prompt,
+            referenceImages,
+          )
+          : await generateOpenAIImage(config, selectedModel, prompt),
+        format: config.outputFormat,
+      };
     case "mulerouter":
-      return await generateMuleRouterImage(
+      return {
+        bytes: await generateMuleRouterImage(
+          config,
+          selectedModel,
+          prompt,
+          referenceImages,
+        ),
+        format: config.outputFormat,
+      };
+    case "xai":
+      return await generateXAIImage(
         config,
         selectedModel,
         prompt,
@@ -397,11 +463,142 @@ async function generateMuleRouterImage(
   return new Uint8Array(await imageResponse.arrayBuffer());
 }
 
+async function generateXAIImage(
+  config: AppConfig,
+  selectedModel: SelectedModel,
+  prompt: string,
+  referenceImages: ReferenceImage[],
+): Promise<GeneratedImage> {
+  const imageInputs = await Promise.all(
+    referenceImages.slice(0, 3).map(localImageAsXAIInput),
+  );
+  const endpoint = imageInputs.length > 0 ? "edits" : "generations";
+  const body: Record<string, unknown> = {
+    model: selectedModel.model,
+    prompt,
+    ...xaiImageSizing(config.size),
+  };
+
+  if (imageInputs.length === 0) {
+    body.n = 1;
+  } else if (imageInputs.length === 1) {
+    body.image = imageInputs[0];
+  } else if (imageInputs.length > 1) {
+    body.images = imageInputs;
+  }
+
+  const response = await fetch(`${XAI_API_BASE}/images/${endpoint}`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${selectedModel.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const image = await xaiImageFromResponse(response, endpoint);
+
+  if (image.b64_json) {
+    return {
+      bytes: decodeBase64(image.b64_json),
+      format: formatFromContentType(image.mime_type) ?? "jpeg",
+    };
+  }
+
+  if (!image.url) {
+    throw new Error("xAI response did not include image data.");
+  }
+
+  return await downloadGeneratedImage(image.url, image.mime_type, "xAI");
+}
+
+async function localImageAsXAIInput(
+  image: ReferenceImage,
+): Promise<{ type: "image_url"; url: string }> {
+  return {
+    type: "image_url",
+    url: await localImageAsDataUrl(image),
+  };
+}
+
+function xaiImageSizing(size: string): Record<string, string> {
+  const dimensions = size.match(/^(\d+)x(\d+)$/);
+  if (!dimensions) return {};
+
+  const width = Number.parseInt(dimensions[1], 10);
+  const height = Number.parseInt(dimensions[2], 10);
+  if (!width || !height) return {};
+
+  const divisor = greatestCommonDivisor(width, height);
+  const resolution = Math.max(width, height) >= 2048 ? "2k" : "1k";
+  return {
+    aspect_ratio: `${width / divisor}:${height / divisor}`,
+    resolution,
+  };
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+  let a = Math.abs(left);
+  let b = Math.abs(right);
+  while (b !== 0) {
+    const next = a % b;
+    a = b;
+    b = next;
+  }
+  return a || 1;
+}
+
 async function localImageAsDataUrl(image: ReferenceImage): Promise<string> {
   const bytes = await Deno.readFile(image.path);
   return `data:${contentTypeForFilename(image.name)};base64,${
     encodeBase64(bytes)
   }`;
+}
+
+async function xaiImageFromResponse(
+  response: Response,
+  action: string,
+): Promise<NonNullable<XAIImagePayload["data"]>[number]> {
+  const text = await response.text();
+  let payload: XAIImagePayload;
+
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`xAI image ${action} returned ${response.status}: ${text}`);
+  }
+
+  if (!response.ok) {
+    const message = payload.error?.message ?? payload.detail ??
+      payload.message ?? `xAI image ${action} returned ${response.status}`;
+    throw new Error(message);
+  }
+
+  const image = payload.data?.[0];
+  if (!image) {
+    throw new Error("xAI response did not include image data.");
+  }
+
+  return image;
+}
+
+async function downloadGeneratedImage(
+  url: string,
+  mimeType: string | undefined,
+  providerLabel: string,
+): Promise<GeneratedImage> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(
+      `${providerLabel} image download returned ${response.status}`,
+    );
+  }
+
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    format: formatFromContentType(mimeType) ??
+      formatFromContentType(response.headers.get("Content-Type")) ??
+      "jpeg",
+  };
 }
 
 function encodeBase64(bytes: Uint8Array): string {
@@ -550,12 +747,23 @@ function decodeBase64(value: string): Uint8Array {
   return bytes;
 }
 
-function outputFilename(format: ImageFormat, sequence: number): string {
+export function outputFilename(
+  format: ImageFormat,
+  sequence: number,
+  model: string,
+): string {
   const timestamp = new Date().toISOString().replaceAll(":", "-").replaceAll(
     ".",
     "-",
   );
-  return `${timestamp}-${sequence}.${format}`;
+  return `${timestamp}-${modelFilenameSlug(model)}-${sequence}.${format}`;
+}
+
+function modelFilenameSlug(model: string): string {
+  return model.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(
+    /^-|-$/g,
+    "",
+  ) || "unknown-model";
 }
 
 function contentTypeForFilename(filename: string): string {
@@ -568,6 +776,19 @@ function contentTypeForFilename(filename: string): string {
     default:
       return "image/png";
   }
+}
+
+function formatFromContentType(
+  contentType: string | null | undefined,
+): ImageFormat | null {
+  if (!contentType) return null;
+  const normalized = contentType.toLowerCase();
+  if (normalized.includes("image/png")) return "png";
+  if (normalized.includes("image/webp")) return "webp";
+  if (normalized.includes("image/jpeg") || normalized.includes("image/jpg")) {
+    return "jpeg";
+  }
+  return null;
 }
 
 function selectedReferenceImages(
@@ -951,9 +1172,14 @@ function renderResults(result: GenerateResult, prompt: string): string {
       }" class="aspect-square w-full object-cover">
         </a>
         <div class="flex items-center justify-between gap-3 px-3 py-2">
-          <span class="truncate text-xs text-zinc-400">${
+          <span class="flex min-w-0 flex-col gap-0.5">
+            <span class="truncate text-xs text-zinc-300">${
+        escapeHtml(image.model)
+      }</span>
+            <span class="truncate text-xs text-zinc-500">${
         escapeHtml(image.filename)
       }</span>
+          </span>
           <a href="${image.url}" target="_blank" rel="noreferrer" class="shrink-0 text-xs font-medium text-sky-400 hover:text-sky-300">Open</a>
         </div>
       </article>`
