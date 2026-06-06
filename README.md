@@ -2,12 +2,13 @@
 
 A minimal Deno app for generating images with OpenAI, Alibaba models through
 MuleRouter, and Grok Imagine through xAI using a prompt and local reference
-images.
+images, plus optional separate text context.
 
 The app uses a server-rendered HTML page with a small amount of browser
 JavaScript, htmx, and Tailwind from CDNs. Reference images are read from a local
-directory, generated images are saved locally, and request history is appended
-to a human-editable YAML file.
+directory, reusable context snippets are read from a local context directory,
+generated images are saved locally, and request history is appended to a
+human-editable YAML file.
 
 ## Setup
 
@@ -66,6 +67,17 @@ reference-images/
 
 Supported formats are `.png`, `.jpg`, `.jpeg`, and `.webp`.
 
+Put reusable context snippets in:
+
+```text
+context/
+```
+
+Supported context formats are `.md`, `.txt`, `.yaml`, and `.yml`. The `context/`
+directory can contain distilled character and setting briefs for image
+generation. Context file contents are local-only and ignored by Git; only the
+directory placeholder is tracked.
+
 MuleRouter's `wan2.6-image` endpoint uses the Alibaba image API through:
 
 ```text
@@ -106,24 +118,41 @@ http://127.0.0.1:8002/
 In the UI:
 
 1. Enter a prompt.
-2. Select a model.
-3. Choose the number of images to generate.
-4. Select which reference images to use.
-5. Click `Generate`.
+2. Choose a context mode:
+   - Use selected context files. Selected file contents appear in the context
+     text box as a read-only preview.
+   - Use manual context from the editable text box.
+3. Select a model.
+4. Choose the number of images to generate.
+5. Select which reference images to use. Click a reference thumbnail to preview
+   it larger in a modal.
+6. Click `Generate`.
+
+The app keeps prompt and context as separate UI fields and request-history
+fields, then combines the active context source with the prompt for the image
+provider. Context files and manual context are mutually exclusive. The combined
+text sent to the image provider must fit the active provider limit. If the
+selected or manual source context is larger than that limit, the app
+automatically selects prompt-relevant chunks and sends the reduced context. The
+result panel shows the context that was actually sent, while request history
+keeps the original selected or manual context. Provider-side validation errors
+are shown in the result panel if a request is rejected after submission.
 
 You can submit multiple requests while earlier requests are still running. Each
 request appears as a separate job panel.
 
 ## Files
 
-- `reference-images/`: local reference images.
-- `outputs/`: generated images. Filenames include the provider/model slug.
+- `context/`: local reusable text context snippets. Contents are ignored by Git.
+- `reference-images/`: local reference images. Contents are ignored by Git.
+- `outputs/`: generated images. Contents are ignored by Git; filenames include
+  the provider/model slug.
 - `requests.yaml`: local request history.
 - `config.json`: local API configuration.
 - `config.example.json`: checked-in config template.
 
-`config.json`, `requests.yaml`, generated outputs, and local reference images
-are ignored by Git.
+`config.json`, `requests.yaml`, local context files, generated outputs, and
+local reference images are ignored by Git.
 
 ## Development
 

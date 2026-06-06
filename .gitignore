@@ -7,4 +7,7 @@ outputs/*
 reference-images/*
 !reference-images/.gitkeep
 
+context/*
+!context/.gitkeep
+
 .DS_Store

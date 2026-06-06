@@ -24,6 +24,33 @@ type ReferenceImage = {
   path: string;
 };
 
+type ContextFile = {
+  name: string;
+  path: string;
+  content: string;
+  chars: number;
+};
+
+type ContextBlock = {
+  name: string;
+  content: string;
+};
+
+type ContextSource = "files" | "manual";
+
+type PreparedImagePrompt = {
+  imagePrompt: string;
+  context: string;
+  wasReduced: boolean;
+  originalContextChars: number;
+};
+
+type ContextChunk = {
+  index: number;
+  heading: string;
+  text: string;
+};
+
 type SavedImage = {
   filename: string;
   path: string;
@@ -96,9 +123,16 @@ type XAIImagePayload = {
 
 const CONFIG_PATH = "config.json";
 const REFERENCE_DIR = "reference-images";
+const CONTEXT_DIR = "context";
 const OUTPUT_DIR = "outputs";
 const HISTORY_PATH = "requests.yaml";
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+const CONTEXT_EXTENSIONS = new Set([".md", ".txt", ".yaml", ".yml"]);
+export const IMAGE_PROMPT_MAX_CHARS = 32_000;
+export const OPENAI_IMAGE_EDIT_PROMPT_MAX_CHARS = IMAGE_PROMPT_MAX_CHARS;
+const RESULT_TEXT_PREVIEW_CHARS = 1_200;
+const CONTEXT_REDUCTION_NOTICE_MAX_CHARS = 600;
+const CONTEXT_REDUCTION_MATCH_PREVIEW = 12;
 const MODEL_OPTIONS: ModelOption[] = [
   {
     label: "OpenAI GPT Image 2",
@@ -175,6 +209,300 @@ export function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+export function composeImagePrompt(prompt: string, context: string): string {
+  const trimmedPrompt = prompt.trim();
+  const trimmedContext = context.trim();
+
+  if (!trimmedContext) return trimmedPrompt;
+  if (!trimmedPrompt) return trimmedContext;
+  return `${trimmedPrompt}\n\nAdditional context:\n${trimmedContext}`;
+}
+
+export function prepareImagePrompt(
+  prompt: string,
+  context: string,
+  maxChars = IMAGE_PROMPT_MAX_CHARS,
+): PreparedImagePrompt {
+  const imagePrompt = composeImagePrompt(prompt, context);
+  if (imagePrompt.length <= maxChars) {
+    return {
+      imagePrompt,
+      context: context.trim(),
+      wasReduced: false,
+      originalContextChars: context.trim().length,
+    };
+  }
+
+  const trimmedPrompt = prompt.trim();
+  const separator = trimmedPrompt ? "\n\nAdditional context:\n" : "";
+  const contextBudget = maxChars - trimmedPrompt.length - separator.length;
+  if (contextBudget <= 0) {
+    return {
+      imagePrompt: trimmedPrompt,
+      context: "",
+      wasReduced: true,
+      originalContextChars: context.trim().length,
+    };
+  }
+
+  const reducedContext = reduceContextForPrompt(
+    trimmedPrompt,
+    context,
+    contextBudget,
+  );
+  return {
+    imagePrompt: composeImagePrompt(trimmedPrompt, reducedContext),
+    context: reducedContext,
+    wasReduced: true,
+    originalContextChars: context.trim().length,
+  };
+}
+
+export function contextSourceFromValue(
+  value: FormDataEntryValue | null,
+): ContextSource {
+  return String(value ?? "files") === "manual" ? "manual" : "files";
+}
+
+export function composeContextText(
+  contextSource: ContextSource,
+  manualContext: string,
+  contextBlocks: ContextBlock[],
+): string {
+  const trimmedManualContext = manualContext.trim();
+  if (contextSource === "manual") return trimmedManualContext;
+
+  const parts: string[] = [];
+  for (const block of contextBlocks) {
+    const content = block.content.trim();
+    if (!content) continue;
+    parts.push(contextBlockText(block.name, content));
+  }
+
+  return parts.join("\n\n");
+}
+
+export function assertImagePromptWithinLimit(imagePrompt: string): void {
+  assertImagePromptWithinLimitFor(imagePrompt, IMAGE_PROMPT_MAX_CHARS);
+}
+
+export function assertImagePromptWithinLimitFor(
+  imagePrompt: string,
+  maxChars: number,
+): void {
+  if (imagePrompt.length <= maxChars) return;
+
+  throw new Error(
+    `Prompt plus context is ${imagePrompt.length} characters after combining them for the image API. The limit is ${maxChars} characters. Shorten the context or prompt before generating.`,
+  );
+}
+
+export function imagePromptLimit(
+  _provider: ProviderName,
+  _referenceImageCount: number,
+): number {
+  return IMAGE_PROMPT_MAX_CHARS;
+}
+
+function reduceContextForPrompt(
+  prompt: string,
+  context: string,
+  maxChars: number,
+): string {
+  const trimmedContext = context.trim();
+  if (trimmedContext.length <= maxChars) return trimmedContext;
+
+  const keywords = promptKeywords(prompt);
+  const notice = contextReductionNotice(
+    trimmedContext.length,
+    maxChars,
+    keywords,
+  );
+  const bodyBudget = Math.max(0, maxChars - notice.length);
+  if (bodyBudget === 0) return notice.slice(0, maxChars);
+
+  const chunks = splitContextChunks(trimmedContext);
+  const scoredChunks = chunks
+    .map((chunk) => ({
+      chunk,
+      score: scoreContextChunk(chunk, keywords),
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score || a.chunk.index - b.chunk.index);
+
+  const selected: ContextChunk[] = [];
+  let used = 0;
+  for (const { chunk } of scoredChunks) {
+    const text = chunk.text.trim();
+    if (!text) continue;
+    const addedLength = text.length + (selected.length === 0 ? 0 : 2);
+    if (used + addedLength <= bodyBudget) {
+      selected.push(chunk);
+      used += addedLength;
+      continue;
+    }
+
+    if (selected.length === 0) {
+      selected.push({
+        ...chunk,
+        text: excerptContextChunk(text, keywords, bodyBudget),
+      });
+    }
+    break;
+  }
+
+  const reducedBody = selected.length > 0
+    ? selected.sort((a, b) => a.index - b.index).map((chunk) =>
+      chunk.text.trim()
+    )
+      .join("\n\n")
+    : trimmedContext.slice(0, bodyBudget);
+
+  return `${notice}${reducedBody}`.slice(0, maxChars).trim();
+}
+
+function contextReductionNotice(
+  originalChars: number,
+  maxChars: number,
+  keywords: string[],
+): string {
+  const preview = keywords.slice(0, CONTEXT_REDUCTION_MATCH_PREVIEW).join(", ");
+  const text = [
+    `[Context auto-reduced from ${originalChars} characters to fit the ${maxChars}-character image prompt limit.`,
+    preview ? `Selected chunks using prompt terms: ${preview}.]` : "]",
+    "",
+    "",
+  ].join(" ");
+
+  return text.length > CONTEXT_REDUCTION_NOTICE_MAX_CHARS
+    ? `${text.slice(0, CONTEXT_REDUCTION_NOTICE_MAX_CHARS - 5)}...]  `
+    : text;
+}
+
+function promptKeywords(prompt: string): string[] {
+  const aliases: Record<string, string[]> = {
+    thryi: ["thryi", "thyri", "glasshouse"],
+    phyv: ["phyv", "talltower", "vampire"],
+    phyr: ["phyr", "phyrv", "na'cl", "halfling"],
+    obi: ["obi", "ro's", "gnome"],
+    academia: ["academia", "career", "fair", "guild", "university"],
+  };
+  const stopWords = new Set([
+    "the",
+    "and",
+    "are",
+    "all",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "into",
+    "keep",
+    "style",
+    "scene",
+    "create",
+    "generate",
+    "image",
+    "new",
+  ]);
+  const normalized = normalizeSearchText(prompt);
+  const terms = new Set(
+    normalized.match(/[a-z0-9][a-z0-9']{2,}/g)?.filter((term) =>
+      !stopWords.has(term)
+    ) ?? [],
+  );
+
+  for (const [key, values] of Object.entries(aliases)) {
+    if (terms.has(key) || values.some((value) => normalized.includes(value))) {
+      for (const value of values) terms.add(value);
+    }
+  }
+
+  return [...terms];
+}
+
+function splitContextChunks(context: string): ContextChunk[] {
+  const lines = context.split(/\r?\n/);
+  const chunks: ContextChunk[] = [];
+  let current: string[] = [];
+  let heading = "";
+
+  const pushCurrent = () => {
+    const text = current.join("\n").trim();
+    if (!text) return;
+    chunks.push({ index: chunks.length, heading, text });
+  };
+
+  for (const line of lines) {
+    if (isContextBoundary(line) && current.length > 0) {
+      pushCurrent();
+      current = [];
+    }
+    if (isContextBoundary(line)) heading = line.trim();
+    current.push(line);
+  }
+  pushCurrent();
+
+  return chunks.length > 0
+    ? chunks
+    : [{ index: 0, heading: "", text: context }];
+}
+
+function isContextBoundary(line: string): boolean {
+  return /^(#{1,4}\s+|###\s+`)/.test(line.trim());
+}
+
+function scoreContextChunk(chunk: ContextChunk, keywords: string[]): number {
+  const text = normalizeSearchText(chunk.text);
+  const heading = normalizeSearchText(chunk.heading);
+  let score = 0;
+  for (const keyword of keywords) {
+    if (!keyword) continue;
+    if (heading.includes(keyword)) score += 12;
+    const matches = text.split(keyword).length - 1;
+    score += Math.min(matches, 8);
+  }
+  return score;
+}
+
+function excerptContextChunk(
+  chunk: string,
+  keywords: string[],
+  maxChars: number,
+): string {
+  if (chunk.length <= maxChars) return chunk;
+  const normalized = normalizeSearchText(chunk);
+  const firstMatch = keywords
+    .map((keyword) => normalized.indexOf(keyword))
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0] ?? 0;
+  const start = Math.max(0, firstMatch - Math.floor(maxChars / 3));
+  const prefix = start > 0 ? "[...]\n" : "";
+  const suffix = start + maxChars < chunk.length ? "\n[...]" : "";
+  const bodyChars = Math.max(0, maxChars - prefix.length - suffix.length);
+  return `${prefix}${chunk.slice(start, start + bodyChars)}${suffix}`;
+}
+
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase()
+    .replaceAll("’", "'")
+    .replaceAll("`", "'")
+    .replaceAll(/[^\p{L}\p{N}']+/gu, " ");
+}
+
+export function textPreview(
+  value: string,
+  maxChars = RESULT_TEXT_PREVIEW_CHARS,
+): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+
+  return `${trimmed.slice(0, maxChars)}... (${
+    trimmed.length - maxChars
+  } more characters)`;
+}
+
 export function extname(path: string): string {
   const index = path.lastIndexOf(".");
   return index === -1 ? "" : path.slice(index).toLowerCase();
@@ -182,6 +510,10 @@ export function extname(path: string): string {
 
 export function isSupportedImage(filename: string): boolean {
   return IMAGE_EXTENSIONS.has(extname(filename));
+}
+
+export function isSupportedContextFile(filename: string): boolean {
+  return CONTEXT_EXTENSIONS.has(extname(filename));
 }
 
 async function loadConfig(): Promise<AppConfig> {
@@ -269,6 +601,7 @@ function selectedModelFromValue(
 
 async function ensureDirectories(): Promise<void> {
   await Deno.mkdir(REFERENCE_DIR, { recursive: true });
+  await Deno.mkdir(CONTEXT_DIR, { recursive: true });
   await Deno.mkdir(OUTPUT_DIR, { recursive: true });
 }
 
@@ -285,6 +618,29 @@ async function listReferenceImages(): Promise<ReferenceImage[]> {
   }
 
   return images.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function listContextFiles(): Promise<ContextFile[]> {
+  await Deno.mkdir(CONTEXT_DIR, { recursive: true });
+
+  const files: ContextFile[] = [];
+  for await (const entry of Deno.readDir(CONTEXT_DIR)) {
+    if (!entry.isFile || !isSupportedContextFile(entry.name)) continue;
+    const path = `${CONTEXT_DIR}/${entry.name}`;
+    const content = await Deno.readTextFile(path);
+    files.push({
+      name: entry.name,
+      path,
+      content,
+      chars: contextBlockText(entry.name, content).length,
+    });
+  }
+
+  return files.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function contextBlockText(name: string, content: string): string {
+  return `### ${name}\n${content.trim()}`;
 }
 
 async function generateImages(
@@ -799,9 +1155,29 @@ function selectedReferenceImages(
   return referenceImages.filter((image) => selected.has(image.name));
 }
 
+function selectedContextFiles(
+  contextFiles: ContextFile[],
+  selectedNames: string[],
+): ContextFile[] {
+  const selected = new Set(selectedNames);
+  return contextFiles.filter((file) => selected.has(file.name));
+}
+
+function readContextBlocks(
+  contextFiles: ContextFile[],
+): ContextBlock[] {
+  return contextFiles.map((file) => ({
+    name: file.name,
+    content: file.content,
+  }));
+}
+
 async function appendHistoryRecord(
   selectedModel: SelectedModel,
   prompt: string,
+  context: string,
+  contextSource: ContextSource,
+  contextFiles: ContextFile[],
   requestedCount: number,
   referenceImages: ReferenceImage[],
   result: GenerateResult,
@@ -823,6 +1199,9 @@ async function appendHistoryRecord(
     renderHistoryRecord({
       date: new Date().toISOString(),
       prompt,
+      context,
+      contextSource,
+      contextFiles: contextFiles.map((file) => file.name),
       model: modelValue(selectedModel),
       referenceImages: referenceImages.map((image) => image.name),
       requestedCount,
@@ -838,6 +1217,9 @@ async function appendHistoryRecord(
 function renderHistoryRecord(record: {
   date: string;
   prompt: string;
+  context: string;
+  contextSource: ContextSource;
+  contextFiles: string[];
   model: string;
   referenceImages: string[];
   requestedCount: number;
@@ -850,6 +1232,15 @@ function renderHistoryRecord(record: {
     "- date: " + yamlScalar(record.date),
     "  prompt: |",
     ...yamlBlock(record.prompt, "    "),
+    ...(record.context
+      ? [
+        "  context: |",
+        ...yamlBlock(record.context, "    "),
+      ]
+      : ['  context: ""']),
+    "  contextSource: " + yamlScalar(record.contextSource),
+    "  contextFiles:",
+    ...yamlList(record.contextFiles, "    "),
     "  model: " + yamlScalar(record.model),
     "  referenceImages:",
     ...yamlList(record.referenceImages, "    "),
@@ -895,9 +1286,17 @@ function yamlScalar(value: string): string {
   return JSON.stringify(value);
 }
 
+function jsonScript(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll("<", "\\u003c")
+    .replaceAll(">", "\\u003e")
+    .replaceAll("&", "\\u0026");
+}
+
 function renderPage(
   config: AppConfig,
   referenceImages: ReferenceImage[],
+  contextFiles: ContextFile[],
 ): string {
   const models = availableModels(config);
   const selectedModel =
@@ -932,6 +1331,8 @@ function renderPage(
       : "No configured API key"
   } using ${referenceImages.length} local reference image${
     referenceImages.length === 1 ? "" : "s"
+  } and ${contextFiles.length} context file${
+    contextFiles.length === 1 ? "" : "s"
   }.
         </p>
       </header>
@@ -954,6 +1355,34 @@ function renderPage(
               placeholder="Describe the image you want to generate..."
             ></textarea>
           </label>
+
+          <fieldset class="flex flex-col gap-3">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <span class="text-sm font-medium text-zinc-200">Context (optional)</span>
+              <span class="flex flex-col gap-1 text-left sm:text-right">
+                <span id="provider-text-count" class="text-xs text-zinc-500">0 / ${IMAGE_PROMPT_MAX_CHARS}</span>
+                <span id="provider-text-limit-note" class="text-[11px] leading-4 text-zinc-500"></span>
+              </span>
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2">
+              <label class="flex cursor-pointer items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200">
+                <input type="radio" name="contextSource" value="files" checked class="h-4 w-4 border-zinc-600 bg-zinc-950 text-sky-500">
+                Use selected context files
+              </label>
+              <label class="flex cursor-pointer items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200">
+                <input type="radio" name="contextSource" value="manual" class="h-4 w-4 border-zinc-600 bg-zinc-950 text-sky-500">
+                Use manual context
+              </label>
+            </div>
+            <textarea
+              id="context"
+              name="context"
+              rows="5"
+              readonly
+              class="w-full resize-y rounded-md border border-zinc-700 bg-zinc-900 px-3 py-3 text-sm leading-6 text-zinc-100 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 read-only:cursor-default read-only:text-zinc-300"
+              placeholder="Style notes, subject details, constraints, or background to keep separate from the prompt..."
+            ></textarea>
+          </fieldset>
 
           <div class="grid gap-4 sm:grid-cols-[minmax(0,1fr)_160px]">
             <label class="flex flex-col gap-2">
@@ -994,15 +1423,28 @@ function renderPage(
           </div>
         </form>
 
-        <aside class="flex flex-col gap-3 border-t border-zinc-800 pt-6 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
-          <div class="flex items-center justify-between gap-3">
-            <h2 class="text-sm font-semibold text-zinc-200">Reference images</h2>
-            <div class="flex gap-2">
-              <button type="button" data-select-references="all" class="text-xs font-medium text-sky-400 hover:text-sky-300">All</button>
-              <button type="button" data-select-references="none" class="text-xs font-medium text-sky-400 hover:text-sky-300">None</button>
+        <aside class="flex flex-col gap-6 border-t border-zinc-800 pt-6 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
+          <section class="flex flex-col gap-3">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold text-zinc-200">Context files</h2>
+              <div class="flex gap-2">
+                <button type="button" data-select-contexts="all" class="text-xs font-medium text-sky-400 hover:text-sky-300">All</button>
+                <button type="button" data-select-contexts="none" class="text-xs font-medium text-sky-400 hover:text-sky-300">None</button>
+              </div>
             </div>
-          </div>
-          ${renderReferenceList(referenceImages)}
+            ${renderContextFileList(contextFiles)}
+          </section>
+
+          <section class="flex flex-col gap-3">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold text-zinc-200">Reference images</h2>
+              <div class="flex gap-2">
+                <button type="button" data-select-references="all" class="text-xs font-medium text-sky-400 hover:text-sky-300">All</button>
+                <button type="button" data-select-references="none" class="text-xs font-medium text-sky-400 hover:text-sky-300">None</button>
+              </div>
+            </div>
+            ${renderReferenceList(referenceImages)}
+          </section>
         </aside>
       </section>
 
@@ -1011,21 +1453,213 @@ function renderPage(
         <div id="jobs" class="flex flex-col-reverse gap-5"></div>
       </section>
     </main>
+    <div
+      id="reference-modal"
+      class="fixed inset-0 z-50 hidden items-center justify-center bg-black/85 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="reference-modal-title"
+    >
+      <div class="flex max-h-full w-full max-w-5xl flex-col overflow-hidden rounded-md border border-zinc-700 bg-zinc-950 shadow-2xl">
+        <div class="flex items-center justify-between gap-3 border-b border-zinc-800 px-4 py-3">
+          <h2 id="reference-modal-title" class="min-w-0 truncate text-sm font-semibold text-zinc-100"></h2>
+          <button type="button" id="reference-modal-close" class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-zinc-700 text-xl leading-none text-zinc-300 hover:border-zinc-500 hover:text-white" aria-label="Close reference preview">&times;</button>
+        </div>
+        <div class="relative flex min-h-0 flex-1 items-center justify-center bg-zinc-950 p-3 sm:p-5">
+          <button type="button" id="reference-modal-prev" class="absolute left-3 top-1/2 inline-flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full border border-zinc-700 bg-zinc-950/80 text-2xl leading-none text-zinc-200 hover:border-zinc-500 hover:bg-zinc-900" aria-label="Previous reference image">&#8249;</button>
+          <img id="reference-modal-image" src="" alt="" class="max-h-[76vh] max-w-full rounded object-contain">
+          <button type="button" id="reference-modal-next" class="absolute right-3 top-1/2 inline-flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full border border-zinc-700 bg-zinc-950/80 text-2xl leading-none text-zinc-200 hover:border-zinc-500 hover:bg-zinc-900" aria-label="Next reference image">&#8250;</button>
+        </div>
+      </div>
+    </div>
+    <script id="context-file-data" type="application/json">${
+    jsonScript(contextFiles.map((file) => ({
+      name: file.name,
+      content: contextBlockText(file.name, file.content),
+    })))
+  }</script>
     <script>
       const form = document.querySelector("form");
       const button = document.querySelector("#generate-button");
       const emptyResults = document.querySelector("#empty-results");
       const jobs = document.querySelector("#jobs");
+      const promptField = document.querySelector("#prompt");
+      const contextField = document.querySelector("#context");
+      const contextSourceFields = Array.from(document.querySelectorAll('input[name="contextSource"]'));
+      const providerTextCount = document.querySelector("#provider-text-count");
+      const providerTextLimitNote = document.querySelector("#provider-text-limit-note");
+      const defaultPromptLimit = ${IMAGE_PROMPT_MAX_CHARS};
+      const openAIEditPromptLimit = ${OPENAI_IMAGE_EDIT_PROMPT_MAX_CHARS};
+      const contextFileContentByName = new Map(
+        JSON.parse(document.querySelector("#context-file-data")?.textContent || "[]")
+          .map((file) => [file.name, file.content])
+      );
+      const referencePreviewButtons = Array.from(document.querySelectorAll("[data-reference-preview-url]"));
+      const referenceModal = document.querySelector("#reference-modal");
+      const referenceModalImage = document.querySelector("#reference-modal-image");
+      const referenceModalTitle = document.querySelector("#reference-modal-title");
+      const referenceModalClose = document.querySelector("#reference-modal-close");
+      const referenceModalPrev = document.querySelector("#reference-modal-prev");
+      const referenceModalNext = document.querySelector("#reference-modal-next");
       let jobSequence = 0;
+      let manualContextDraft = "";
+      let lastContextSource = "files";
+      let activeReferenceIndex = -1;
+
+      function contextSource() {
+        return contextSourceFields.find((input) => input.checked)?.value || "files";
+      }
 
       function selectedReferenceCount() {
         return document.querySelectorAll('input[name="referenceImages"]:checked').length;
       }
 
-      function createJobPanel(prompt, count) {
+      function selectedModelProvider() {
+        const value = String(new FormData(form).get("model") || "");
+        return value.split(":")[0] || "";
+      }
+
+      function plural(count, singular, pluralValue = singular + "s") {
+        return count === 1 ? singular : pluralValue;
+      }
+
+      function providerPromptLimitDetails() {
+        const provider = selectedModelProvider();
+        const referenceCount = selectedReferenceCount();
+        if (provider === "openai" && referenceCount > 0) {
+          return {
+            maxChars: openAIEditPromptLimit,
+            note: \`OpenAI reference request: \${referenceCount} selected \${plural(referenceCount, "reference")}.\`,
+          };
+        }
+
+        return {
+          maxChars: defaultPromptLimit,
+          note: referenceCount > 0
+            ? \`\${provider || "Selected provider"}: \${referenceCount} selected \${plural(referenceCount, "reference")}.\`
+            : \`\${provider || "Selected provider"} generation limit: no references selected.\`,
+        };
+      }
+
+      function selectedContextCount() {
+        if (contextSource() !== "files") return 0;
+        return document.querySelectorAll('input[name="contextFiles"]:checked').length;
+      }
+
+      function selectedContextText() {
+        if (contextSource() !== "files") return "";
+        return Array.from(document.querySelectorAll('input[name="contextFiles"]:checked'))
+          .map((input) => contextFileContentByName.get(input.value) || "")
+          .filter((content) => content.trim())
+          .join("\\n\\n");
+      }
+
+      function composedContextLength(context) {
+        return context.trim().length;
+      }
+
+      function composedPromptLength(prompt, context) {
+        const trimmedPrompt = prompt.trim();
+        const contextLength = composedContextLength(context);
+        if (contextLength === 0) return trimmedPrompt.length;
+        if (!trimmedPrompt) return contextLength;
+        return trimmedPrompt.length + "\\n\\nAdditional context:\\n".length + contextLength;
+      }
+
+      function updateProviderTextCount() {
+        const activeContextSource = contextSource();
+        const filesMode = activeContextSource === "files";
+        if (lastContextSource === "manual" && filesMode) {
+          manualContextDraft = contextField.value;
+        }
+        if (filesMode) {
+          contextField.value = selectedContextText();
+        } else if (lastContextSource !== "manual") {
+          contextField.value = manualContextDraft;
+        }
+        contextField.readOnly = filesMode;
+        contextField.placeholder = filesMode
+          ? "Selected context file contents will appear here..."
+          : "Style notes, subject details, constraints, or background to keep separate from the prompt...";
+        document.querySelectorAll('input[name="contextFiles"]').forEach((input) => {
+          input.disabled = !filesMode;
+        });
+        document.querySelectorAll("[data-select-contexts]").forEach((button) => {
+          button.disabled = !filesMode;
+          button.classList.toggle("opacity-40", !filesMode);
+          button.classList.toggle("cursor-not-allowed", !filesMode);
+        });
+
+        const promptLimit = providerPromptLimitDetails();
+        const length = composedPromptLength(promptField.value, contextField.value);
+        const promptOnlyLength = promptField.value.trim().length;
+        const sourceOverLimit = length > promptLimit.maxChars;
+        const promptTooLong = promptOnlyLength > promptLimit.maxChars;
+        providerTextCount.textContent = sourceOverLimit
+          ? \`\${length} source / \${promptLimit.maxChars} send limit\`
+          : \`\${length} / \${promptLimit.maxChars}\`;
+        providerTextCount.className = promptTooLong
+          ? "text-xs font-medium text-red-300"
+          : sourceOverLimit
+          ? "text-xs font-medium text-amber-300"
+          : "text-xs text-zinc-500";
+        providerTextLimitNote.textContent = sourceOverLimit && !promptTooLong
+          ? \`\${promptLimit.note} Source context will be auto-reduced before sending.\`
+          : promptLimit.note;
+        providerTextLimitNote.className = promptTooLong
+          ? "text-[11px] leading-4 text-red-300"
+          : sourceOverLimit
+          ? "text-[11px] leading-4 text-amber-300"
+          : "text-[11px] leading-4 text-zinc-500";
+
+        promptField.setCustomValidity("");
+        contextField.setCustomValidity("");
+        if (promptTooLong) {
+          promptField.setCustomValidity(
+            \`Prompt alone is \${promptOnlyLength} characters; limit is \${promptLimit.maxChars}.\`,
+          );
+        }
+        lastContextSource = activeContextSource;
+      }
+
+      function openReferenceModal(index) {
+        if (!referenceModal || referencePreviewButtons.length === 0) return;
+        activeReferenceIndex = index;
+        const button = referencePreviewButtons[activeReferenceIndex];
+        referenceModalImage.src = button.dataset.referencePreviewUrl || "";
+        referenceModalImage.alt = button.dataset.referencePreviewName || "";
+        referenceModalTitle.textContent = button.dataset.referencePreviewName || "";
+        const multipleImages = referencePreviewButtons.length > 1;
+        referenceModalPrev.hidden = !multipleImages;
+        referenceModalNext.hidden = !multipleImages;
+        referenceModal.classList.remove("hidden");
+        referenceModal.classList.add("flex");
+        referenceModalClose.focus();
+      }
+
+      function closeReferenceModal() {
+        if (!referenceModal) return;
+        referenceModal.classList.add("hidden");
+        referenceModal.classList.remove("flex");
+        referenceModalImage.src = "";
+        activeReferenceIndex = -1;
+      }
+
+      function showAdjacentReference(offset) {
+        if (activeReferenceIndex === -1 || referencePreviewButtons.length === 0) return;
+        const nextIndex = (activeReferenceIndex + offset + referencePreviewButtons.length) % referencePreviewButtons.length;
+        openReferenceModal(nextIndex);
+      }
+
+      function createJobPanel(prompt, context, count) {
         jobSequence += 1;
         const jobId = \`job-\${Date.now()}-\${jobSequence}\`;
         const referenceCount = selectedReferenceCount();
+        const contextCount = selectedContextCount();
+        const manualContextProvided = contextSource() === "manual" && context;
+        const contextSummary = contextSource() === "manual"
+          ? (manualContextProvided ? "manual context provided" : "no manual context")
+          : \`\${contextCount} context file\${contextCount === 1 ? "" : "s"}\`;
         const panel = document.createElement("article");
         panel.id = jobId;
         panel.className = "rounded-md border border-sky-900/70 bg-sky-950/30 px-4 py-3";
@@ -1033,8 +1667,8 @@ function renderPage(
           <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div class="min-w-0">
               <div class="text-sm font-semibold text-sky-100">Generating \${count} image\${count === "1" ? "" : "s"}</div>
-              <div class="mt-1 text-xs text-sky-200/80">\${referenceCount} selected reference image\${referenceCount === 1 ? "" : "s"}</div>
-              <div class="mt-1 truncate text-xs text-sky-200/70"></div>
+              <div class="mt-1 text-xs text-sky-200/80">\${referenceCount} selected reference image\${referenceCount === 1 ? "" : "s"}; \${contextSummary}</div>
+              <div class="mt-1 truncate text-xs text-sky-200/70" data-prompt-preview></div>
             </div>
             <div class="inline-flex items-center gap-2 text-xs font-medium text-sky-100">
               <span class="h-2 w-2 animate-pulse rounded-full bg-sky-300"></span>
@@ -1042,13 +1676,14 @@ function renderPage(
             </div>
           </div>
         \`;
-        panel.querySelector(".truncate").textContent = prompt;
+        panel.querySelector("[data-prompt-preview]").textContent = prompt;
         jobs.append(panel);
         emptyResults.hidden = true;
         return jobId;
       }
 
       function submitJob(event) {
+        updateProviderTextCount();
         if (!form.reportValidity()) {
           event.preventDefault();
           return;
@@ -1057,8 +1692,9 @@ function renderPage(
         event.preventDefault();
         const formData = new FormData(form);
         const prompt = String(formData.get("prompt") || "").trim();
+        const context = String(formData.get("context") || "").trim();
         const count = String(formData.get("count") || "1");
-        const jobId = createJobPanel(prompt, count);
+        const jobId = createJobPanel(prompt, context, count);
 
         console.info(\`Generate request submitted: \${jobId}\`);
         fetch("/generate", {
@@ -1081,11 +1717,54 @@ function renderPage(
       }
 
       form.addEventListener("submit", submitJob);
+      promptField.addEventListener("input", updateProviderTextCount);
+      contextField.addEventListener("input", () => {
+        if (contextSource() === "manual") manualContextDraft = contextField.value;
+        updateProviderTextCount();
+      });
+      document.querySelector('select[name="model"]')?.addEventListener("change", updateProviderTextCount);
+      contextSourceFields.forEach((input) => {
+        input.addEventListener("change", updateProviderTextCount);
+      });
+      updateProviderTextCount();
+      document.querySelector('[data-select-contexts="all"]')?.addEventListener("click", () => {
+        if (contextSource() !== "files") return;
+        document.querySelectorAll('input[name="contextFiles"]').forEach((input) => input.checked = true);
+        updateProviderTextCount();
+      });
+      document.querySelector('[data-select-contexts="none"]')?.addEventListener("click", () => {
+        if (contextSource() !== "files") return;
+        document.querySelectorAll('input[name="contextFiles"]').forEach((input) => input.checked = false);
+        updateProviderTextCount();
+      });
+      document.querySelectorAll('input[name="contextFiles"]').forEach((input) => {
+        input.addEventListener("change", updateProviderTextCount);
+      });
+      referencePreviewButtons.forEach((button, index) => {
+        button.addEventListener("click", () => openReferenceModal(index));
+      });
+      referenceModalClose?.addEventListener("click", closeReferenceModal);
+      referenceModalPrev?.addEventListener("click", () => showAdjacentReference(-1));
+      referenceModalNext?.addEventListener("click", () => showAdjacentReference(1));
+      referenceModal?.addEventListener("click", (event) => {
+        if (event.target === referenceModal) closeReferenceModal();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (!referenceModal || referenceModal.classList.contains("hidden")) return;
+        if (event.key === "Escape") closeReferenceModal();
+        if (event.key === "ArrowLeft") showAdjacentReference(-1);
+        if (event.key === "ArrowRight") showAdjacentReference(1);
+      });
       document.querySelector('[data-select-references="all"]')?.addEventListener("click", () => {
         document.querySelectorAll('input[name="referenceImages"]').forEach((input) => input.checked = true);
+        updateProviderTextCount();
       });
       document.querySelector('[data-select-references="none"]')?.addEventListener("click", () => {
         document.querySelectorAll('input[name="referenceImages"]').forEach((input) => input.checked = false);
+        updateProviderTextCount();
+      });
+      document.querySelectorAll('input[name="referenceImages"]').forEach((input) => {
+        input.addEventListener("change", updateProviderTextCount);
       });
     </script>
   </body>
@@ -1113,6 +1792,25 @@ function renderModelOptions(
     .join("");
 }
 
+function renderContextFileList(contextFiles: ContextFile[]): string {
+  if (contextFiles.length === 0) {
+    return `<p class="text-sm leading-6 text-zinc-500">Place .md, .txt, .yaml, or .yml files in ${CONTEXT_DIR}/ to use them as reusable context.</p>`;
+  }
+
+  const items = contextFiles
+    .map((file) =>
+      `<label class="flex cursor-pointer items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-300 hover:border-zinc-700">
+        <input type="checkbox" name="contextFiles" value="${
+        escapeHtml(file.name)
+      }" form="generate-form" checked data-context-chars="${file.chars}" class="h-4 w-4 rounded border-zinc-600 bg-zinc-950 text-sky-500">
+        <span class="min-w-0 flex-1 truncate">${escapeHtml(file.name)}</span>
+      </label>`
+    )
+    .join("");
+
+  return `<div class="flex max-h-48 flex-col gap-2 overflow-y-auto pr-1">${items}</div>`;
+}
+
 function renderReferenceList(referenceImages: ReferenceImage[]): string {
   if (referenceImages.length === 0) {
     return `<p class="text-sm leading-6 text-zinc-500">Place .png, .jpg, .jpeg, or .webp files in ${REFERENCE_DIR}/ to use them as references.</p>`;
@@ -1120,27 +1818,42 @@ function renderReferenceList(referenceImages: ReferenceImage[]): string {
 
   const items = referenceImages
     .map((image) =>
-      `<label class="grid cursor-pointer grid-cols-[72px_minmax(0,1fr)] gap-3 rounded-md border border-zinc-800 bg-zinc-900 p-2 text-sm text-zinc-300 hover:border-zinc-700">
-        <img src="/references/${
+      `<article class="grid grid-cols-[104px_minmax(0,1fr)] gap-3 rounded-md border border-zinc-800 bg-zinc-900 p-2 text-sm text-zinc-300 hover:border-zinc-700">
+        <button
+          type="button"
+          data-reference-preview-url="/references/${
         encodeURIComponent(image.name)
-      }" alt="" class="h-16 w-16 rounded object-cover">
+      }"
+          data-reference-preview-name="${escapeHtml(image.name)}"
+          class="group relative h-24 w-24 overflow-hidden rounded border border-zinc-800 bg-zinc-950"
+          aria-label="Open ${escapeHtml(image.name)} preview"
+        >
+          <img src="/references/${
+        encodeURIComponent(image.name)
+      }" alt="" class="h-full w-full object-cover transition group-hover:scale-105">
+          <span class="absolute bottom-1 right-1 rounded bg-zinc-950/80 px-1.5 py-0.5 text-[10px] font-medium text-zinc-200">View</span>
+        </button>
         <span class="flex min-w-0 flex-col justify-between gap-2">
           <span class="truncate">${escapeHtml(image.name)}</span>
-          <span class="inline-flex items-center gap-2 text-xs text-zinc-400">
+          <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-zinc-400">
             <input type="checkbox" name="referenceImages" value="${
         escapeHtml(image.name)
       }" form="generate-form" checked class="h-4 w-4 rounded border-zinc-600 bg-zinc-950 text-sky-500">
             Use as reference
-          </span>
+          </label>
         </span>
-      </label>`
+      </article>`
     )
     .join("");
 
   return `<div class="flex max-h-[520px] flex-col gap-2 overflow-y-auto pr-1">${items}</div>`;
 }
 
-function renderResults(result: GenerateResult, prompt: string): string {
+function renderResults(
+  result: GenerateResult,
+  prompt: string,
+  context: string,
+): string {
   const savedImages = result.attempts
     .map((attempt) => attempt.saved)
     .filter((image): image is SavedImage => Boolean(image));
@@ -1212,6 +1925,18 @@ function renderResults(result: GenerateResult, prompt: string): string {
   return `<article class="flex flex-col gap-4 rounded-md border border-zinc-800 bg-zinc-950 p-4">
     <div class="rounded-md border px-4 py-3 text-sm leading-6 ${statusClass}">
       ${statusText} Duration: ${result.durationMs}ms.
+    </div>
+    <div class="space-y-1 break-words text-xs leading-5 text-zinc-500">
+      <div><span class="font-medium text-zinc-400">Prompt:</span> ${
+    escapeHtml(textPreview(prompt))
+  }</div>
+      ${
+    context
+      ? `<div class="whitespace-pre-wrap"><span class="font-medium text-zinc-400">Context:</span> ${
+        escapeHtml(textPreview(context))
+      }</div>`
+      : ""
+  }
     </div>
     ${
     savedImages.length > 0
@@ -1292,7 +2017,8 @@ async function handler(request: Request): Promise<Response> {
     try {
       const config = await loadConfig();
       const referenceImages = await listReferenceImages();
-      return html(renderPage(config, referenceImages));
+      const contextFiles = await listContextFiles();
+      return html(renderPage(config, referenceImages, contextFiles));
     } catch (error) {
       return html(renderError(error), 500);
     }
@@ -1311,6 +2037,23 @@ async function handler(request: Request): Promise<Response> {
       if (!prompt) {
         throw new Error("Prompt is required.");
       }
+      const contextSource = contextSourceFromValue(form.get("contextSource"));
+      const manualContext = String(form.get("context") ?? "").trim();
+      const allContextFiles = await listContextFiles();
+      const selectedContextNames = form.getAll("contextFiles").map((value) =>
+        String(value)
+      );
+      const contextFiles = contextSource === "files"
+        ? selectedContextFiles(
+          allContextFiles,
+          selectedContextNames,
+        )
+        : [];
+      const context = composeContextText(
+        contextSource,
+        manualContext,
+        readContextBlocks(contextFiles),
+      );
 
       const count = clampImageCount(form.get("count"));
       const allReferenceImages = await listReferenceImages();
@@ -1321,15 +2064,21 @@ async function handler(request: Request): Promise<Response> {
         allReferenceImages,
         selectedNames,
       );
+      const promptLimit = imagePromptLimit(
+        selectedModel.provider,
+        referenceImages.length,
+      );
+      const preparedPrompt = prepareImagePrompt(prompt, context, promptLimit);
+      assertImagePromptWithinLimitFor(preparedPrompt.imagePrompt, promptLimit);
       console.log(
         `Generate request: model=${
           modelValue(selectedModel)
-        } count=${count} selected_references=${referenceImages.length} prompt_chars=${prompt.length}`,
+        } count=${count} selected_references=${referenceImages.length} context_source=${contextSource} selected_context_files=${contextFiles.length} prompt_chars=${prompt.length} context_chars=${context.length} effective_context_chars=${preparedPrompt.context.length} context_reduced=${preparedPrompt.wasReduced} prompt_limit=${promptLimit}`,
       );
       const attempts = await generateImages(
         config,
         selectedModel,
-        prompt,
+        preparedPrompt.imagePrompt,
         count,
         referenceImages,
       );
@@ -1338,6 +2087,9 @@ async function handler(request: Request): Promise<Response> {
       await appendHistoryRecord(
         selectedModel,
         prompt,
+        context,
+        contextSource,
+        contextFiles,
         count,
         referenceImages,
         result,
@@ -1353,7 +2105,7 @@ async function handler(request: Request): Promise<Response> {
           saved.map((image) => image.filename).join(", ")
         } failed=${failures.length} duration_ms=${durationMs}`,
       );
-      return html(renderResults(result, prompt));
+      return html(renderResults(result, prompt, preparedPrompt.context));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(
